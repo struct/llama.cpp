@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <functional>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  ifndef NOMINMAX
@@ -1592,9 +1593,13 @@ static void rpc_serve_client(ggml_backend_t backend, const char * cache_dir,
     }
 }
 
-void ggml_backend_rpc_start_server(ggml_backend_t backend, const char * endpoint,
-                                   const char * cache_dir,
-                                   size_t free_mem, size_t total_mem) {
+void ggml_backend_rpc_start_server(
+    ggml_backend_t backend,
+    const char * endpoint,
+    const char * cache_dir,
+    size_t free_mem,
+    size_t total_mem,
+    std::function<void(void)> on_sock_create) {
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
@@ -1623,12 +1628,18 @@ void ggml_backend_rpc_start_server(ggml_backend_t backend, const char * endpoint
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+
+    if (on_sock_create) {
+        on_sock_create();
+    }
+
     while (true) {
         auto client_socket = socket_accept(server_socket->fd);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             return;
         }
+
         printf("Accepted client connection, free_mem=%zu, total_mem=%zu\n", free_mem, total_mem);
         fflush(stdout);
         rpc_serve_client(backend, cache_dir, client_socket->fd, free_mem, total_mem);

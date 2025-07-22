@@ -23,6 +23,47 @@
 #include <algorithm>
 #include <thread>
 
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <seccomp.h>
+
+static void install_seccomp_filter() {
+#if defined(__linux__)
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
+    if (!ctx) {
+        fprintf(stderr, "Failed to create seccomp filter %s\n", strerror(errno));
+        exit(1);
+    }
+
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigaction), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_gettime), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettimeofday), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept4), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(setsockopt), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sendto), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(recvfrom), 0);
+
+    if (seccomp_load(ctx) < 0) {
+        fprintf(stderr, "Failed to create seccomp filter %s\n", strerror(errno));
+        exit(1);
+    }
+#else
+    fprintf(stdout, "Seccomp filter only supported on Linux\n");
+#endif
+}
+
 namespace fs = std::filesystem;
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
@@ -315,7 +356,16 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(backend, endpoint.c_str(), cache_dir, free_mem, total_mem);
+    start_server_fn(
+        backend,
+        endpoint.c_str(),
+        cache_dir,
+        free_mem,
+        total_mem,
+        []() {
+            install_seccomp_filter();
+        }
+    );
 
     ggml_backend_free(backend);
     return 0;
