@@ -511,7 +511,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
             ggml_set_name(&info.t, name.c_str());
 
             // make sure there are no duplicate tensor names
-            auto [it, result]  = tensor_names.emplace(info.t.name, i);
+            auto [it, result] = tensor_names.emplace(info.t.name, i);
             if (!result) {
                 GGML_LOG_ERROR("%s: duplicate tensor name '%s' for tensors %" PRIi64 " and %" PRIi64 "\n", __func__, info.t.name, i, it->second);
                 ok = false;
