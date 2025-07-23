@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <memory>
@@ -97,6 +98,7 @@ enum rpc_cmd {
     RPC_CMD_GET_ALLOC_SIZE,
     RPC_CMD_HELLO,
     RPC_CMD_COUNT,
+    RPC_CMD_AUTH,
 };
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
@@ -106,6 +108,15 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
+};
+
+struct rpc_msg_auth_req {
+    uint16_t length;
+    uint8_t token[256];
+};
+
+struct rpc_msg_auth_resp {
+    bool result;
 };
 
 struct rpc_msg_get_alloc_size_req {
@@ -426,8 +437,32 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 // RPC client-side implementation
 
 static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
+    const char * auth_token_s = std::getenv("GGML_RPC_TOKEN");
+
+    if (auth_token_s == nullptr) {
+        fprintf(stderr, "No authentication token secret found in environment\n");
+        return false;
+    }
+
+    rpc_msg_auth_req auth_request;
+    auth_request.length = strlen(auth_token_s);
+    snprintf((char *)auth_request.token,
+         sizeof(auth_request.token),
+         "%.*s",
+         (int)sizeof(auth_request.token)-1,
+         auth_token_s);
+
+    rpc_msg_auth_resp auth_response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_AUTH, &auth_request, sizeof(rpc_msg_auth_req), &auth_response, sizeof(rpc_msg_auth_resp));
+    RPC_STATUS_ASSERT(status);
+
+    if (auth_response.result == false) {
+        fprintf(stderr, "Failed to authenticate to RPC server\n");
+        return false;
+    }
+
     rpc_msg_hello_rsp response;
-    bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, nullptr, 0, &response, sizeof(response));
+    status = send_rpc_cmd(sock, RPC_CMD_HELLO, nullptr, 0, &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         fprintf(stderr, "RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
@@ -1371,14 +1406,86 @@ rpc_server::~rpc_server() {
     }
 }
 
+// Implementation borrowed from https://github.com/chmike/cst_time_memcmp
+static int cst_time_memcmp(const void *m1, const void *m2, size_t n)  {
+    const unsigned char *pm1 = (const unsigned char*)m1;
+    const unsigned char *pm2 = (const unsigned char*)m2;
+    int res = 0, diff;
+    if (n > 0) {
+        do {
+            --n;
+            diff = pm1[n] - pm2[n];
+            res = (res & -!diff) | diff;
+        } while (n != 0);
+    }
+    return (res > 0) - (res < 0);
+}
+
 static void rpc_serve_client(ggml_backend_t backend, const char * cache_dir,
                              sockfd_t sockfd, size_t free_mem, size_t total_mem) {
+
+    const char * auth_token_s = std::getenv("GGML_RPC_TOKEN");
+    if (auth_token_s == nullptr) {
+        fprintf(stderr, "[%s] Authentication token secret not set\n", __func__);
+        return;
+    }
+
+    size_t auth_token_s_len = strlen(auth_token_s);
+
     rpc_server server(backend, cache_dir);
     uint8_t cmd;
+
     if (!recv_data(sockfd, &cmd, 1)) {
         return;
     }
-    // the first command sent by the client must be HELLO
+
+    // The first command sent by the client must be AUTH
+    if (cmd != RPC_CMD_AUTH) {
+        fprintf(stderr, "Expected AUTH command, update client\n");
+        return;
+    }
+
+    rpc_msg_auth_req request;
+    if (!recv_msg(sockfd, &request, sizeof(request))) {
+        fprintf(stderr, "Failed to process AUTH request, update client\n");
+        return;
+    }
+
+    rpc_msg_auth_resp auth_response;
+
+    // This is insecure for the following reasons:
+    //  0) It is probably susceptible to cache timing attacks
+    //  1) It may leak the size of the secret auth token
+    //  2) It can be brute forced
+    //  3) It compares secrets directly, not their hashes
+    //  4) It can be intercepted on the wire (use socat/openssl)
+    //  5) The token doesn't expire
+    if (request.length != auth_token_s_len ||
+            cst_time_memcmp((void *) auth_token_s, (void *) &request.token, auth_token_s_len) != 0) {
+        struct sockaddr_in peer_addr;
+        socklen_t peer_len = sizeof(peer_addr);
+
+        if (getpeername(sockfd, (struct sockaddr *)&peer_addr, &peer_len) == 0) {
+            char *ip = inet_ntoa(peer_addr.sin_addr);
+            fprintf(stderr, "[%s] Invalid authentication token from %s\n",
+                    __func__, ip);
+        } else {
+            fprintf(stderr, "[%s] Invalid authentication token from unknown (getpeername failed)\n",
+                    __func__);
+        }
+        auth_response.result = false;
+        send_msg(sockfd, &auth_response, sizeof(auth_response));
+        return;
+    }
+
+    auth_response.result = true;
+    send_msg(sockfd, &auth_response, sizeof(auth_response));
+
+    if (!recv_data(sockfd, &cmd, 1)) {
+        return;
+    }
+
+    // The second command sent by the client must be HELLO
     if (cmd != RPC_CMD_HELLO) {
         fprintf(stderr, "Expected HELLO command, update client\n");
         return;
