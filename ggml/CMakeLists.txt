@@ -92,6 +92,7 @@ option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)
 option(GGML_SANITIZE_THREAD    "ggml: enable thread sanitizer"    OFF)
 option(GGML_SANITIZE_ADDRESS   "ggml: enable address sanitizer"   OFF)
 option(GGML_SANITIZE_UNDEFINED "ggml: enable undefined sanitizer" OFF)
+option(GGML_SANITIZE_FUZZER    "ggml: enable libfuzzer sanitizer" OFF)
 
 # instruction set specific
 if (GGML_NATIVE OR NOT GGML_NATIVE_DEFAULT)

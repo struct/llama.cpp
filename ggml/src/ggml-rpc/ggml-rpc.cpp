@@ -1592,6 +1592,14 @@ static void rpc_serve_client(ggml_backend_t backend, const char * cache_dir,
     }
 }
 
+#if defined(GGML_SANITIZE_FUZZER)
+void fuzz_rpc_serve_client(ggml_backend_t backend, const char * cache_dir,
+                             sockfd_t sockfd, size_t free_mem, size_t total_mem) {
+    rpc_serve_client(backend, cache_dir, sockfd, free_mem, total_mem);
+    return;
+}
+#endif
+
 void ggml_backend_rpc_start_server(ggml_backend_t backend, const char * endpoint,
                                    const char * cache_dir,
                                    size_t free_mem, size_t total_mem) {
@@ -1765,6 +1773,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+#if defined(GGML_SANITIZE_FUZZER)
+    if (std::strcmp(name, "fuzz_rpc_serve_client") == 0) {
+        return (void *)fuzz_rpc_serve_client;
+    }
+#endif
     return NULL;
 
     GGML_UNUSED(reg);

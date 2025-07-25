@@ -13,6 +13,11 @@ extern "C" {
 #define GGML_RPC_MAX_SERVERS       16
 
 // backend API
+#if defined(GGML_SANITIZE_FUZZER)
+typedef int sockfd_t;
+GGML_BACKEND_API void fuzz_rpc_serve_client(ggml_backend_t backend, const char * cache_dir,
+                             sockfd_t sockfd, size_t free_mem, size_t total_mem);
+#endif
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 

@@ -104,7 +104,11 @@ GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * 
 #define GGML_LOG_DEBUG(...) ggml_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define GGML_LOG_CONT(...)  ggml_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 
+#if defined(GGML_SANITIZE_FUZZER)
+#define GGML_DEBUG 10
+#else
 #define GGML_DEBUG 0
+#endif
 
 #if (GGML_DEBUG >= 1)
 #define GGML_PRINT_DEBUG(...) GGML_LOG_DEBUG(__VA_ARGS__)
