@@ -23,6 +23,11 @@ if (NOT MSVC)
         add_compile_options(-fsanitize=undefined)
         link_libraries     (-fsanitize=undefined)
     endif()
+
+    if (GGML_SANITIZE_FUZZER)
+        add_compile_options(-fsanitize=fuzzer -fno-omit-frame-pointer)
+        link_libraries     (-fsanitize=fuzzer)
+    endif()
 endif()
 
 if (GGML_FATAL_WARNINGS)

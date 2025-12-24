@@ -249,6 +249,89 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     return devices;
 }
 
+#if defined(GGML_SANITIZE_FUZZER)
+#include <sys/socket.h>
+#include <random>
+
+rpc_server_params params;
+ggml_backend_reg_t reg;
+std::vector<ggml_backend_dev_t> devices;
+std::vector<ggml_backend_t> backends;
+void (*start_server_fn)(const std::vector<ggml_backend_t> & backends, const char *cache_dir, int sockfd);
+
+// LLVM doesn't expose these function prototypes in a public header
+extern "C" const char* __asan_default_options();
+extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv);
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+
+extern "C" const char* __asan_default_options() {
+    return "allocator_may_return_null=1:abort_on_error=0";
+}
+
+extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    GGML_UNUSED(argc);
+    GGML_UNUSED(argv);
+
+    ggml_backend_load_all();
+    devices = get_devices(params);
+    if (devices.empty()) {
+        fprintf(stderr, "No devices found\n");
+        return 1;
+    }
+
+    // Initialize backends from devices
+    for (auto dev : devices) {
+        auto backend = ggml_backend_dev_init(dev, nullptr);
+        if (!backend) {
+            fprintf(stderr, "Failed to create backend for device %s\n", ggml_backend_dev_name(dev));
+            exit(-1);
+        }
+        backends.push_back(backend);
+    }
+
+    reg = ggml_backend_reg_by_name("RPC");
+
+    if (!reg) {
+        fprintf(stderr, "Failed to find RPC backend\n");
+        exit(-1);
+    }
+
+    start_server_fn = (decltype(start_server_fn)) ggml_backend_reg_get_proc_address(reg, "fuzz_rpc_serve_client");
+
+    if (!start_server_fn) {
+        fprintf(stderr, "Failed to obtain RPC backend start server function\n");
+        exit(-1);
+    }
+
+    return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    int sv[2];
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        return 0;
+    }
+
+    uint64_t payload_len = 0;
+    const int RPC_CMD_HELLO = 14;
+
+    write(sv[1], &RPC_CMD_HELLO, 1);
+    write(sv[1], &payload_len, sizeof(payload_len));
+    write(sv[1], Data, Size);
+    shutdown(sv[1], SHUT_WR);
+
+    try {
+        start_server_fn(backends, nullptr, sv[0]);
+    } catch (...) {
+    }
+
+    close(sv[0]);
+    close(sv[1]);
+
+    return 0;
+}
+#else
 int main(int argc, char * argv[]) {
     ggml_backend_load_all();
 
@@ -300,3 +383,4 @@ int main(int argc, char * argv[]) {
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;
 }
+#endif

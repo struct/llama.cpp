@@ -437,6 +437,11 @@ static bool recv_msg(sockfd_t sockfd, std::vector<uint8_t> & input) {
     if (!recv_data(sockfd, &size, sizeof(size))) {
         return false;
     }
+#if defined(GGML_SANITIZE_FUZZER)
+    if(size > 0x10000) {
+        size = 0x100000;
+    }
+#endif
     try {
         input.resize(size);
     } catch (const std::bad_alloc & e) {
@@ -1601,7 +1606,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
-            GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+            //GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
         switch (cmd) {
@@ -1823,6 +1828,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+#if defined(GGML_SANITIZE_FUZZER)
+void fuzz_rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                             sockfd_t sockfd) {
+    rpc_serve_client(backends, cache_dir, sockfd);
+    return;
+}
+#endif
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -2029,6 +2042,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+#if defined(GGML_SANITIZE_FUZZER)
+    if (std::strcmp(name, "fuzz_rpc_serve_client") == 0) {
+        return (void *)fuzz_rpc_serve_client;
+    }
+#endif
     return NULL;
 
     GGML_UNUSED(reg);

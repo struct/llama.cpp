@@ -3,6 +3,14 @@
 #include "ggml-backend.h"
 
 #ifdef  __cplusplus
+
+#if defined(GGML_SANITIZE_FUZZER)
+#include <vector>
+typedef int sockfd_t;
+GGML_BACKEND_API void fuzz_rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                             sockfd_t sockfd);
+#endif
+
 extern "C" {
 #endif
 
