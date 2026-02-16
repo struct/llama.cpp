@@ -1,0 +1,57 @@
+# Example policy file for rpc-server
+# This file can configure both server parameters, and security policies 
+# such as Unix socket credentials and sandbox
+#
+# Usage: rpc-server --policy-file /path/to/policy.conf
+
+# ======================================================================
+# Server Configuration
+# ======================================================================
+
+# Host to bind to, or path to Unix socket (must end in .sock)
+# host = 127.0.0.1
+host = /tmp/llama-rpc.sock
+
+# Port to bind to (only used for TCP, ignored for Unix sockets)
+port = 50052
+
+# Number of threads for the CPU backend
+threads = 4
+
+# Comma-separated list of devices to expose
+# device = CUDA0,CUDA1
+
+# Enable local file cache for tensor data
+cache = false
+
+# Enable Linux sandbox (seccomp, chroot, rlimits) - Linux only
+sandbox = false
+
+# ======================================================================
+# Unix Socket Credential Policy
+# ======================================================================
+# These settings use SO_PEERCRED (Linux) to verify connecting processes
+
+# Automatically allow connections from root (UID 0)
+# Set to false to require root to be in allowed_uid list
+allow_root = true
+
+# Log all connection attempts (accepted and rejected)
+log_connections = true
+
+# Allowed UIDs - only these UIDs can connect
+# If no allowed_uid entries, all UIDs are allowed (subject to allow_root)
+# Can specify multiple entries
+allowed_uid = 1000
+
+# Allowed GIDs - only these GIDs can connect
+# If no allowed_gid entries, all GIDs are allowed
+# Can specify multiple entries
+allowed_gid = 1000
+
+# Allowed executables - only these binaries can connect (LINUX ONLY)
+# Verified via /proc/PID/exe - ignored on macOS/BSD
+# If no allowed_exe entries, all executables are allowed
+# Can specify multiple entries
+# allowed_exe = /usr/local/bin/llama-cli
+# allowed_exe = /usr/local/bin/llama-server
