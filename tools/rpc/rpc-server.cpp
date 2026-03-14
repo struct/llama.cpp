@@ -28,12 +28,47 @@
 #include <seccomp.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/sysmacros.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
+#include <dirent.h>
+#include <fcntl.h>
+
+// Try to include libcap if available
+#ifdef __has_include
+#  if __has_include(<sys/capability.h>)
+#    include <sys/capability.h>
+#    define HAVE_LIBCAP 1
+#  endif
+#endif
+
+// Capability constants (defined in <sys/capability.h> / <linux/capability.h>)
+// Define fallbacks in case neither header is available
+#ifndef CAP_SYS_ADMIN
+#  include <linux/capability.h>
+#endif
+#ifndef CAP_SYS_ADMIN
+#  define CAP_SYS_ADMIN    21
+#  define CAP_IPC_LOCK     14
+#  define CAP_SYS_RESOURCE 24
+#endif
+
+// Compatibility definitions
+#ifndef CAP_LAST_CAP
+#define CAP_LAST_CAP 40  // As of Linux 5.10+, but we'll try up to this
+#endif
+
 #endif
 
 #if defined(__linux__)
 #include <sys/types.h>
 #include <pwd.h>
 #endif
+
+// Forward declaration (defined later in file, used by sandbox code)
+static bool fs_create_directory_with_parents(const std::string & path);
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
 #ifdef _WIN32
@@ -56,6 +91,452 @@ static std::wstring utf8_to_wstring(const std::string & str) {
 #endif
 
 #if defined(__linux__)
+// ============================================================================
+// Enhanced Linux Sandbox Implementation
+// ============================================================================
+//
+// Security layers (applied in order):
+// 1. Cgroup v2 resource limits (memory, PIDs)
+// 2. Namespace isolation (user, net, mount, UTS, IPC)
+// 3. Filesystem isolation via pivot_root in mount namespace (stronger than chroot)
+// 4. Process-level resource limits (rlimits for file descriptors, processes, file size)
+// 5. Capability dropping (all caps dropped; GPU mode preserves SYS_ADMIN, IPC_LOCK, SYS_RESOURCE)
+// 6. PR_SET_NO_NEW_PRIVS (prevents privilege escalation)
+// 7. Seccomp-BPF filter with argument filtering (syscall whitelist, blocks dangerous operations)
+//
+// Key improvements over basic chroot + seccomp:
+// - Namespace isolation prevents process visibility, network access, and mount escapes
+// - pivot_root in mount namespace is more secure than chroot alone
+// - Capability dropping ensures no elevated privileges even if running as root
+// - Cgroup limits provide hierarchical resource control across process tree
+// - Argument filtering in seccomp blocks PROT_EXEC in mmap/mprotect (prevents JIT/code injection)
+// - User namespace enables unprivileged sandboxing without requiring root
+// - GPU-aware mode: Automatically bind-mounts GPU devices and preserves GPU capabilities
+//   when CUDA/GPU backend is detected (trades device isolation for GPU functionality)
+//
+// Limitations:
+// - PID namespace requires fork to take effect, so main process still in host PID namespace
+// - Cgroup setup requires writable /sys/fs/cgroup (may need root or cgroup delegation)
+// - Some features require recent kernel (user namespace: 3.8+, seccomp arg filtering: 3.5+)
+// - Cgroup v2 required for unified hierarchy (older systems use cgroup v1)
+//
+// Trade-offs:
+// - PROT_EXEC blocking may break JIT compilers or programs that need executable memory
+// - Network namespace isolation means no network access (appropriate for local RPC server)
+// - Aggressive syscall filtering may break compatibility with some libraries
+//
+// ============================================================================
+
+// Scan a range of numbered device paths and append any that exist to the list
+static void scan_device_range(std::vector<std::string>& paths, const char* fmt, int start, int end) {
+    for (int i = start; i < end; i++) {
+        char dev_path[64];
+        snprintf(dev_path, sizeof(dev_path), fmt, i);
+        if (access(dev_path, F_OK) == 0) {
+            paths.push_back(dev_path);
+        }
+    }
+}
+
+// Detect available GPU device nodes on the host system
+static void detect_gpu_devices(std::vector<std::string>& gpu_device_paths) {
+    // NVIDIA numbered devices (nvidia0-nvidia15)
+    scan_device_range(gpu_device_paths, "/dev/nvidia%d", 0, 16);
+
+    // NVIDIA control devices
+    for (const char* dev : {"/dev/nvidiactl", "/dev/nvidia-modeset",
+                             "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"}) {
+        if (access(dev, F_OK) == 0) {
+            gpu_device_paths.push_back(dev);
+        }
+    }
+
+    // AMD/Intel DRI: card devices (card0-card15) and render nodes (renderD128-renderD143)
+    scan_device_range(gpu_device_paths, "/dev/dri/card%d",    0,   16);
+    scan_device_range(gpu_device_paths, "/dev/dri/renderD%d", 128, 144);
+
+    if (!gpu_device_paths.empty()) {
+        fprintf(stdout, "Detected %zu GPU device nodes:\n", gpu_device_paths.size());
+        for (const auto& dev : gpu_device_paths) {
+            fprintf(stdout, "  - %s\n", dev.c_str());
+        }
+    }
+}
+
+// Close unnecessary file descriptors to prevent fd leaks
+// Preserves stdin(0), stdout(1), stderr(2), and low-numbered fds that might be server sockets
+// Only closes fds >= min_fd_to_close to avoid accidentally closing critical server infrastructure
+static void sanitize_file_descriptors(int min_fd_to_close) {
+    // Default to a conservative threshold to avoid closing server sockets
+    // which are typically opened early and have low fd numbers
+    if (min_fd_to_close < 0) {
+        min_fd_to_close = 10;  // Conservative: preserve fds 0-9
+    }
+
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        fprintf(stderr, "Warning: Failed to open /proc/self/fd for fd sanitization: %s\n", strerror(errno));
+        // Fallback: try to close fds in a reasonable range
+        for (int fd = min_fd_to_close; fd < 1024; fd++) {
+            close(fd);  // Will silently fail for invalid fds, which is fine
+        }
+        return;
+    }
+
+    int dir_fd = dirfd(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        int fd = atoi(entry->d_name);
+        // Only close fds above the threshold, and not the dir fd itself
+        if (fd >= min_fd_to_close && fd != dir_fd) {
+            close(fd);
+        }
+    }
+    closedir(dir);
+
+    fprintf(stdout, "File descriptors >= %d sanitized\n", min_fd_to_close);
+}
+
+// Drop all Linux capabilities except those required for GPU access
+static void drop_capabilities_gpu_aware(bool preserve_gpu_caps) {
+    // Capabilities to preserve for GPU operations
+    const int gpu_required_caps[] = {
+        CAP_SYS_ADMIN,    // Device access, GPU ioctls, some memory operations
+        CAP_IPC_LOCK,     // Pin memory for DMA transfers (cudaMallocHost, etc.)
+        CAP_SYS_RESOURCE, // Override memory limits for large GPU allocations
+        -1
+    };
+
+    auto is_gpu_cap = [&](int cap) {
+        for (const int* p = gpu_required_caps; *p != -1; p++) {
+            if (*p == cap) return true;
+        }
+        return false;
+    };
+
+    // Clear capability bounding set (except GPU-required if requested)
+    for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
+        if (preserve_gpu_caps && is_gpu_cap(cap)) {
+            continue;  // Skip GPU-required capabilities
+        }
+
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0) {
+            // Capability might not exist, continue
+            if (errno != EINVAL) {
+                fprintf(stderr, "Warning: Failed to drop capability %d: %s\n", cap, strerror(errno));
+            }
+        }
+    }
+
+    // Clear ambient capabilities (except GPU-required if requested)
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
+#endif
+    if (!preserve_gpu_caps) {
+        // Clear all ambient capabilities
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
+            if (errno != EINVAL) {
+                fprintf(stderr, "Warning: Failed to clear ambient capabilities: %s\n", strerror(errno));
+            }
+        }
+    }
+
+    // If libcap is available, use it for more granular control
+#ifdef HAVE_LIBCAP
+    if (preserve_gpu_caps) {
+        // Create capability set with only GPU-required caps
+        cap_t cap_set = cap_init();
+        if (cap_set) {
+            cap_value_t caps_array[3] = {CAP_SYS_ADMIN, CAP_IPC_LOCK, CAP_SYS_RESOURCE};
+            if (cap_set_flag(cap_set, CAP_EFFECTIVE, 3, caps_array, CAP_SET) == 0 &&
+                cap_set_flag(cap_set, CAP_PERMITTED, 3, caps_array, CAP_SET) == 0) {
+                if (cap_set_proc(cap_set) < 0) {
+                    fprintf(stderr, "Warning: Failed to set GPU capabilities: %s\n", strerror(errno));
+                }
+            }
+            cap_free(cap_set);
+        }
+    } else {
+        // Drop all capabilities
+        cap_t empty = cap_init();
+        if (empty) {
+            if (cap_set_proc(empty) < 0) {
+                fprintf(stderr, "Warning: Failed to drop capabilities via cap_set_proc: %s\n", strerror(errno));
+            }
+            cap_free(empty);
+        } else {
+            fprintf(stderr, "Warning: Failed to initialize capability state\n");
+        }
+    }
+#else
+    fprintf(stdout, "Note: libcap not available, using prctl-only capability dropping\n");
+#endif
+
+    if (preserve_gpu_caps) {
+        fprintf(stdout, "GPU-aware capabilities: preserved CAP_SYS_ADMIN, CAP_IPC_LOCK, CAP_SYS_RESOURCE\n");
+    } else {
+        fprintf(stdout, "All capabilities dropped (CPU-only mode)\n");
+    }
+}
+
+// Write a string value to a cgroup control file
+static bool write_cgroup_file(const char * path, const char * value, const char * label) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Warning: Failed to open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    bool ok = write(fd, value, strlen(value)) > 0;
+    close(fd);
+    if (ok) {
+        fprintf(stdout, "%s\n", label);
+    } else {
+        fprintf(stderr, "Warning: Failed to write %s: %s\n", path, strerror(errno));
+    }
+    return ok;
+}
+
+// Setup cgroup v2 resource limits (optional, requires cgroup v2)
+static void setup_cgroup_limits() {
+    const char * cgroup_base = "/sys/fs/cgroup";
+    const char * cgroup_name = "ggml-rpc-sandbox";
+
+    // Check if cgroup v2 is available
+    struct stat st;
+    if (stat(cgroup_base, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stdout, "Cgroup v2 not available, skipping cgroup limits\n");
+        return;
+    }
+
+    // Try to create our cgroup
+    char cgroup_path[512];
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", cgroup_base, cgroup_name);
+
+    if (mkdir(cgroup_path, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "Warning: Failed to create cgroup: %s\n", strerror(errno));
+        return;
+    }
+
+    char path[512];
+
+    // Memory limit: 4GB — adjust for your model size
+    snprintf(path, sizeof(path), "%s/memory.max", cgroup_path);
+    write_cgroup_file(path, "4294967296\n", "Cgroup memory limit set to 4GB");
+
+    // PIDs limit: prevents fork bombs (mainly limits thread creation since fork is blocked)
+    snprintf(path, sizeof(path), "%s/pids.max", cgroup_path);
+    write_cgroup_file(path, "128\n", "Cgroup PIDs limit set to 128");
+
+    // Move current process into the cgroup
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
+    snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_path);
+    write_cgroup_file(path, pid_str, "Process moved to cgroup");
+}
+
+// Setup namespace isolation
+static bool setup_namespaces() {
+    // Create new namespaces
+    // CLONE_NEWUSER must be first to enable unprivileged operation
+    // We'll do this in multiple steps for compatibility
+
+    // First, unshare user namespace if not root (for unprivileged sandboxing)
+    bool is_root = (geteuid() == 0);
+
+    if (!is_root) {
+        if (unshare(CLONE_NEWUSER) < 0) {
+            fprintf(stderr, "Warning: Failed to create user namespace: %s\n", strerror(errno));
+            fprintf(stderr, "Note: Continuing without user namespace (requires root for other namespaces)\n");
+            return false;
+        }
+        fprintf(stdout, "User namespace created\n");
+
+        // Map current user to root in the new namespace
+        int uid = getuid();
+        int gid = getgid();
+
+        // Write uid_map
+        char uid_map[128];
+        snprintf(uid_map, sizeof(uid_map), "0 %d 1\n", uid);
+        int fd = open("/proc/self/uid_map", O_WRONLY);
+        if (fd >= 0) {
+            write(fd, uid_map, strlen(uid_map));
+            close(fd);
+        }
+
+        // Deny setgroups
+        fd = open("/proc/self/setgroups", O_WRONLY);
+        if (fd >= 0) {
+            write(fd, "deny\n", 5);
+            close(fd);
+        }
+
+        // Write gid_map
+        char gid_map[128];
+        snprintf(gid_map, sizeof(gid_map), "0 %d 1\n", gid);
+        fd = open("/proc/self/gid_map", O_WRONLY);
+        if (fd >= 0) {
+            write(fd, gid_map, strlen(gid_map));
+            close(fd);
+        }
+    }
+
+    // Create other namespaces (excluding CLONE_NEWNS — handled by setup_mount_namespace)
+    // Note: CLONE_NEWPID requires fork to take effect, so we omit it here
+    int unshare_flags = CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC;
+
+    if (unshare(unshare_flags) < 0) {
+        fprintf(stderr, "Warning: Failed to create namespaces: %s\n", strerror(errno));
+        return false;
+    }
+
+    fprintf(stdout, "Network, UTS, and IPC namespaces created\n");
+
+    // Note: PID namespace requires fork, which we can't easily do here
+    // without restructuring the entire application. The parent process
+    // will still be in the original PID namespace, but child processes would be isolated.
+
+    return true;
+}
+
+// Setup mount namespace with pivot_root (more secure than chroot)
+static bool setup_mount_namespace(const char * jail_path, const std::vector<std::string>* gpu_devices) {
+    // Ensure we're in a mount namespace
+    if (unshare(CLONE_NEWNS) < 0) {
+        fprintf(stderr, "Warning: Failed to create mount namespace: %s\n", strerror(errno));
+        return false;
+    }
+
+    // Make everything private to prevent mount propagation
+    if (mount(nullptr, "/", nullptr, MS_PRIVATE | MS_REC, nullptr) < 0) {
+        fprintf(stderr, "Warning: Failed to make mounts private: %s\n", strerror(errno));
+    }
+
+    // Create jail directory if it doesn't exist
+    if (mkdir(jail_path, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "Warning: Failed to create jail directory: %s\n", strerror(errno));
+        return false;
+    }
+
+    // Create necessary subdirectories
+    char dev_path[256], proc_path[256], tmp_path[256];
+    snprintf(dev_path, sizeof(dev_path), "%s/dev", jail_path);
+    snprintf(proc_path, sizeof(proc_path), "%s/proc", jail_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/tmp", jail_path);
+
+    mkdir(dev_path, 0755);
+    mkdir(proc_path, 0555);
+    mkdir(tmp_path, 0777);
+
+    // Mount tmpfs for writable areas with size limits
+    if (mount("tmpfs", tmp_path, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=16M") < 0) {
+        fprintf(stderr, "Warning: Failed to mount tmpfs on /tmp: %s\n", strerror(errno));
+    }
+
+    // Mount minimal /dev with necessary devices
+    if (mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "size=1M") < 0) {
+        fprintf(stderr, "Warning: Failed to mount tmpfs on /dev: %s\n", strerror(errno));
+    } else {
+        // Create essential device nodes
+        char null_path[256], zero_path[256], urandom_path[256];
+        snprintf(null_path, sizeof(null_path), "%s/null", dev_path);
+        snprintf(zero_path, sizeof(zero_path), "%s/zero", dev_path);
+        snprintf(urandom_path, sizeof(urandom_path), "%s/urandom", dev_path);
+
+        // These will fail if we don't have permissions, but that's okay
+        mknod(null_path, S_IFCHR | 0666, makedev(1, 3));
+        mknod(zero_path, S_IFCHR | 0666, makedev(1, 5));
+        mknod(urandom_path, S_IFCHR | 0444, makedev(1, 9));
+    }
+
+    // Bind-mount GPU device nodes if requested
+    if (gpu_devices != nullptr && !gpu_devices->empty()) {
+        fprintf(stdout, "Bind-mounting GPU devices into jail...\n");
+
+        for (const auto& host_dev_path : *gpu_devices) {
+            char jail_dev_path[512];
+            snprintf(jail_dev_path, sizeof(jail_dev_path), "%s%s", jail_path, host_dev_path.c_str());
+
+            // Create parent directories (/dev/dri for DRI devices)
+            fs_create_directory_with_parents(jail_dev_path);
+
+            // Get device major/minor numbers from host
+            struct stat st;
+            if (stat(host_dev_path.c_str(), &st) < 0) {
+                fprintf(stderr, "Warning: Failed to stat %s: %s\n", host_dev_path.c_str(), strerror(errno));
+                continue;
+            }
+
+            // Create device node placeholder in jail
+            if (mknod(jail_dev_path, S_IFCHR | 0666, st.st_rdev) < 0 && errno != EEXIST) {
+                fprintf(stderr, "Warning: Failed to create device node %s: %s\n", jail_dev_path, strerror(errno));
+                // Try bind-mounting anyway
+            }
+
+            // Bind mount from host to jail
+            if (mount(host_dev_path.c_str(), jail_dev_path, NULL, MS_BIND, NULL) < 0) {
+                fprintf(stderr, "Warning: Failed to bind-mount %s: %s\n", host_dev_path.c_str(), strerror(errno));
+            } else {
+                fprintf(stdout, "  ✓ Bind-mounted: %s\n", host_dev_path.c_str());
+            }
+        }
+    }
+
+    // Use pivot_root instead of chroot for stronger isolation
+    // First, mount the jail as a bind mount to itself (requirement for pivot_root)
+    if (mount(jail_path, jail_path, nullptr, MS_BIND | MS_REC, nullptr) < 0) {
+        fprintf(stderr, "Warning: Failed to bind mount jail: %s\n", strerror(errno));
+        return false;
+    }
+
+    // Create old_root directory inside new root
+    char old_root_path[256];
+    snprintf(old_root_path, sizeof(old_root_path), "%s/.old_root", jail_path);
+    if (mkdir(old_root_path, 0000) < 0 && errno != EEXIST) {
+        fprintf(stderr, "Warning: Failed to create old_root: %s\n", strerror(errno));
+    }
+
+    // Change to the new root
+    if (chdir(jail_path) < 0) {
+        fprintf(stderr, "Warning: Failed to chdir to jail: %s\n", strerror(errno));
+        return false;
+    }
+
+    // Perform pivot_root
+    if (syscall(SYS_pivot_root, ".", ".old_root") < 0) {
+        fprintf(stderr, "Warning: pivot_root failed, falling back to chroot: %s\n", strerror(errno));
+        // Fallback to chroot - use "." since we already chdir'd into jail_path
+        if (chroot(".") < 0) {
+            fprintf(stderr, "Warning: chroot also failed: %s\n", strerror(errno));
+            return false;
+        }
+    } else {
+        // Unmount and remove old root
+        if (umount2(".old_root", MNT_DETACH) < 0) {
+            fprintf(stderr, "Warning: Failed to unmount old root: %s\n", strerror(errno));
+        }
+        rmdir(".old_root");
+        fprintf(stdout, "pivot_root successful\n");
+    }
+
+    // Change to root directory
+    if (chdir("/") < 0) {
+        fprintf(stderr, "Warning: Failed to chdir to /: %s\n", strerror(errno));
+        return false;
+    }
+
+    // Mount new proc filesystem (read-only)
+    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY, nullptr) < 0) {
+        fprintf(stderr, "Warning: Failed to mount proc: %s\n", strerror(errno));
+    }
+
+    fprintf(stdout, "Mount namespace setup complete\n");
+    return true;
+}
+
 static void install_rlimits(bool use_cache) {
     struct rlimit rl;
     rl.rlim_cur = 64;
@@ -83,13 +564,24 @@ static void install_rlimits(bool use_cache) {
     fprintf(stdout, "Resource limits installed\n");
 }
 
-static void install_chroot() {
+// Filesystem isolation entry point: tries pivot_root in a mount namespace first,
+// falls back to plain chroot if that fails (e.g. insufficient privileges)
+static void install_chroot(const std::vector<std::string>* gpu_devices) {
+    const char * jail_path = "/tmp/secure-ggml-rpc-jail";
+
+    // Try the more secure mount namespace approach first
+    if (setup_mount_namespace(jail_path, gpu_devices)) {
+        fprintf(stdout, "Secure mount namespace jail installed at %s\n", jail_path);
+        return;
+    }
+
+    // Fallback to traditional chroot if mount namespace setup failed
+    fprintf(stdout, "Falling back to basic chroot isolation\n");
+
     if (geteuid() != 0) {
         fprintf(stdout, "Skipping chroot (requires root privileges)\n");
         return;
     }
-
-    const char * jail_path = "/tmp/secure-ggml-rpc-jail";
 
     if (mkdir(jail_path, 0755) < 0 && errno != EEXIST) {
         fprintf(stderr, "Warning: Failed to create chroot jail directory: %s\n", strerror(errno));
@@ -106,7 +598,7 @@ static void install_chroot() {
         return;
     }
 
-    fprintf(stdout, "Chroot jail installed at %s\n", jail_path);
+    fprintf(stdout, "Basic chroot jail installed at %s\n", jail_path);
 }
 
 static void install_no_new_privs() {
@@ -119,14 +611,19 @@ static void install_no_new_privs() {
 }
 
 static void install_seccomp_filter() {
-    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
+    // Use SCMP_ACT_ERRNO for more graceful degradation instead of immediately killing the process
+    // This allows better debugging and more controlled failures
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
     if (!ctx) {
         fprintf(stderr, "Failed to create seccomp filter %s\n", strerror(errno));
         exit(1);
     }
 
+    // Allow essential syscalls for the RPC server operation
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(openat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(readlink), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(readlinkat), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(lseek), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
@@ -136,7 +633,14 @@ static void install_seccomp_filter() {
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+
+    // Allow mmap but restrict executable pages
+    // Block PROT_EXEC to prevent JIT/code generation attacks
+    {
+        struct scmp_arg_cmp mmap_prot_arg = {2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0};
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 1, mmap_prot_arg);
+    }
+
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
@@ -146,11 +650,21 @@ static void install_seccomp_filter() {
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettimeofday), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept4), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getsockopt), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(setsockopt), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sendto), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(recvfrom), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sendmsg), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(recvmsg), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpeername), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sysinfo), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
+
+    // Allow mprotect but block adding PROT_EXEC
+    {
+        struct scmp_arg_cmp mprotect_prot_arg = {2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0};
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 1, mprotect_prot_arg);
+    }
+
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mremap), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(futex), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(newfstatat), 0);
@@ -172,11 +686,21 @@ static void install_seccomp_filter() {
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(poll), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ppoll), 0);
 
+    // Explicitly block dangerous syscalls with SCMP_ACT_KILL for critical violations
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(ptrace), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(process_vm_readv), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(process_vm_writev), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(execve), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(execveat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(fork), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(vfork), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 0);
+
     if (seccomp_load(ctx) < 0) {
         fprintf(stderr, "Failed to load seccomp filter %s\n", strerror(errno));
         exit(1);
     } else {
-        fprintf(stdout, "Seccomp filter installed\n");
+        fprintf(stdout, "Seccomp filter installed (ERRNO mode with argument filtering)\n");
     }
 
     seccomp_release(ctx);
@@ -435,6 +959,7 @@ struct rpc_server_params {
     std::string              policy_file;  // Path to policy configuration file
     rpc_policy               policy;       // Peer credential policy
     bool        use_sandbox  = false;
+    int         socket_mode  = 0660;       // Unix socket file permissions (octal)
 #endif
 };
 
@@ -448,7 +973,14 @@ static void print_usage(char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
 #if defined(__linux__)
-    fprintf(stderr, "  -s, --sandbox                    enable basic Linux sandbox\n");
+    fprintf(stderr, "  -s, --sandbox                    enable enhanced Linux sandbox\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Sandbox behavior with GPU devices:\n");
+    fprintf(stderr, "  When GPU devices are detected, the sandbox automatically:\n");
+    fprintf(stderr, "    • Bind-mounts GPU device nodes (/dev/nvidia*, /dev/dri/*) into jail\n");
+    fprintf(stderr, "    • Preserves capabilities: CAP_SYS_ADMIN, CAP_IPC_LOCK, CAP_SYS_RESOURCE\n");
+    fprintf(stderr, "    • All other protections remain active (namespaces, seccomp, cgroups)\n");
+    fprintf(stderr, "  For CPU-only workloads: Full device isolation is used\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Unix socket policy options (apply to .sock endpoints)\n");
     fprintf(stderr, "  --policy-file FILE               load policy from configuration file\n");
@@ -457,6 +989,7 @@ static void print_usage(char ** argv, rpc_server_params params) {
     fprintf(stderr, "  --allowed-exe PATH               allow connections from executable (can be repeated)\n");
     fprintf(stderr, "  --no-allow-root                  do not automatically allow root (UID 0)\n");
     fprintf(stderr, "  --quiet-policy                   disable policy connection logging\n");
+    fprintf(stderr, "  --socket-mode MODE               unix socket permissions in octal (default: 660)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Security Policy file format (one directive per line):\n");
     fprintf(stderr, "  # Comment lines start with #\n");
@@ -466,6 +999,7 @@ static void print_usage(char ** argv, rpc_server_params params) {
     fprintf(stderr, "  device = CUDA0,CUDA1\n");
     fprintf(stderr, "  cache = true\n");
     fprintf(stderr, "  sandbox = true\n");
+    fprintf(stderr, "  socket_mode = 660\n");
     fprintf(stderr, "  allowed_uid = 1000\n");
     fprintf(stderr, "  allowed_gid = 1000\n");
     fprintf(stderr, "  allowed_exe = /usr/bin/llama-cli\n");
@@ -520,7 +1054,7 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
 #if defined(__linux__)
-        } else if (arg == "-s" || arg == "--seccomp") {
+        } else if (arg == "-s" || arg == "--sandbox") {
             params.use_sandbox = true;
         } else if (arg == "--policy-file") {
             if (++i >= argc) {
@@ -556,6 +1090,16 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.policy.allow_root = false;
         } else if (arg == "--quiet-policy") {
             params.policy.log_connections = false;
+        } else if (arg == "--socket-mode") {
+            if (++i >= argc) {
+                return false;
+            }
+            try {
+                params.socket_mode = std::stoi(argv[i], nullptr, 8);
+            } catch (const std::exception &) {
+                fprintf(stderr, "error: invalid socket mode (expected octal, e.g. 660): %s\n", argv[i]);
+                return false;
+            }
 #endif
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv, params);
@@ -601,6 +1145,13 @@ static bool apply_policy_directive(const std::string & key, const std::string & 
         params.use_cache = (value == "true" || value == "1" || value == "yes");
     } else if (key == "sandbox") {
         params.use_sandbox = (value == "true" || value == "1" || value == "yes");
+    } else if (key == "socket_mode") {
+        try {
+            params.socket_mode = std::stoi(value, nullptr, 8);
+        } catch (...) {
+            fprintf(stderr, "policy: invalid socket_mode (expected octal, e.g. 660): %s\n", value.c_str());
+            return false;
+        }
     }
     // Policy parameters
     else if (key == "allowed_uid") {
@@ -731,11 +1282,15 @@ int main(int argc, char * argv[]) {
         }
         // CLI args take precedence, so we merge policy file into params
         // Only override if not set via CLI
+        int default_threads = std::max(1U, std::thread::hardware_concurrency()/2);
         if (params.host == "127.0.0.1" && policy_params.host != "127.0.0.1") {
             params.host = policy_params.host;
         }
         if (params.port == 50052 && policy_params.port != 50052) {
             params.port = policy_params.port;
+        }
+        if (params.n_threads == default_threads && policy_params.n_threads != default_threads) {
+            params.n_threads = policy_params.n_threads;
         }
         if (params.devices.empty() && !policy_params.devices.empty()) {
             params.devices = policy_params.devices;
@@ -746,6 +1301,9 @@ int main(int argc, char * argv[]) {
 #if defined(__linux__)
         if (!params.use_sandbox && policy_params.use_sandbox) {
             params.use_sandbox = policy_params.use_sandbox;
+        }
+        if (params.socket_mode == 0660 && policy_params.socket_mode != 0660) {
+            params.socket_mode = policy_params.socket_mode;
         }
 #endif
         // Merge policy settings (CLI additions take precedence)
@@ -856,18 +1414,95 @@ int main(int argc, char * argv[]) {
 
     if (params.use_sandbox) {
         bool use_cache = params.use_cache;
+
+        // Detect GPU devices on the host BEFORE entering sandbox
+        std::vector<std::string> gpu_devices;
+        bool has_gpu = false;
+        for (const auto& dev : devices) {
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                has_gpu = true;
+                break;
+            }
+        }
+
+        if (has_gpu) {
+            detect_gpu_devices(gpu_devices);
+        }
+
+        // Capture socket info for chmod inside callback (ggml-rpc hardcodes chmod 0770 after bind)
+        std::string sock_path = is_unix_socket ? params.host : "";
+        int sock_mode = params.socket_mode;
+
         start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
-            [use_cache]() {
-                install_chroot();
+            [use_cache, has_gpu, gpu_devices, sock_path, sock_mode]() {
+                // Fix socket permissions immediately — ggml-rpc hardcodes 0770 after bind(),
+                // so we must override it here, before pivot_root makes the path inaccessible.
+                if (!sock_path.empty()) {
+                    if (chmod(sock_path.c_str(), sock_mode) < 0) {
+                        fprintf(stderr, "Warning: Failed to set socket mode %03o on %s: %s\n",
+                                sock_mode, sock_path.c_str(), strerror(errno));
+                    } else {
+                        fprintf(stdout, "Socket permissions set to %03o on %s\n", sock_mode, sock_path.c_str());
+                    }
+                }
+
+                fprintf(stdout, "\n=== Initializing Enhanced Sandbox ===\n");
+
+                if (has_gpu) {
+                    fprintf(stdout, "GPU-aware mode: Device isolation weakened for GPU access\n");
+                } else {
+                    fprintf(stdout, "CPU-only mode: Full device isolation active\n");
+                }
+
+                // 1. Setup cgroup limits first (before namespace isolation)
+                // This must be done before entering namespaces that might restrict access to /sys
+                setup_cgroup_limits();
+
+                // 2. Setup namespaces (for isolation)
+                // This enables user namespace for unprivileged operation
+                setup_namespaces();
+
+                // 3. Sanitize file descriptors (optional, disabled by default for safety)
+                // Uncomment if you want to close fds >= 100 to prevent leaks
+                // This is conservative to avoid closing server sockets (typically fd 3-10)
+                // sanitize_file_descriptors(100);
+
+                // 4. Setup filesystem isolation with GPU device bind-mounts if needed
+                install_chroot(has_gpu ? &gpu_devices : nullptr);
+
+                // 5. Install resource limits (process-level via rlimits)
                 install_rlimits(use_cache);
+
+                // 6. Drop capabilities (preserve GPU-required if GPU present)
+                drop_capabilities_gpu_aware(has_gpu);
+
+                // 7. Install no_new_privs (must be before seccomp)
                 install_no_new_privs();
+
+                // 8. Install seccomp filter (MUST BE LAST)
+                // Seccomp must be installed after all other prctl calls
                 install_seccomp_filter();
+
+                fprintf(stdout, "=== Sandbox Initialization Complete ===\n\n");
             },
             on_client_connect);
     } else {
+        std::string sock_path = is_unix_socket ? params.host : "";
+        int sock_mode = params.socket_mode;
+        auto sock_create_cb = is_unix_socket
+            ? std::function<void()>([sock_path, sock_mode]() {
+                if (chmod(sock_path.c_str(), sock_mode) < 0) {
+                    fprintf(stderr, "Warning: Failed to set socket mode %03o on %s: %s\n",
+                            sock_mode, sock_path.c_str(), strerror(errno));
+                } else {
+                    fprintf(stdout, "Socket permissions set to %03o on %s\n", sock_mode, sock_path.c_str());
+                }
+              })
+            : std::function<void()>(nullptr);
         start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
-                        nullptr, on_client_connect);
+                        sock_create_cb, on_client_connect);
     }
+
 #else
     // Non-Linux and Windows
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
